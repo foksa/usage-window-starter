@@ -29,10 +29,8 @@ var panel struct {
 	// itself causes that too.
 	blurredAt time.Time
 	// idle closes the panel once hidden (after panelIdle), which ends its WebKit
-	// processes (about 40 MB). pendingShow: a new panel is shown once its page has
-	// loaded.
-	idle        *time.Timer
-	pendingShow bool
+	// processes (about 40 MB).
+	idle *time.Timer
 }
 
 // panelIdle is how long a hidden panel is kept. Recreating it takes about 0.2 s,
@@ -163,13 +161,10 @@ func createPanel() {
 				changed := r.Height != panel.height
 				panel.height = r.Height
 				x, y, id := panel.x, panel.y, panel.windowID
-				pending := panel.pendingShow
-				panel.pendingShow = false
 				panel.mu.Unlock()
-				switch {
-				case pending: // the new panel's page is ready and has its height
-					revealPanel()
-				case changed && panelVisible():
+				// Also while hidden: the page can report its height between placePanel
+				// and ShowWindow.
+				if changed && id != 0 {
 					_ = app.core.SetWindowFrame(id, electrobun.NewRect(x, y, panelWidth, r.Height))
 				}
 			},
@@ -188,7 +183,7 @@ func destroyPanel() {
 	}
 	panel.mu.Lock()
 	windowID, webviewID := panel.windowID, panel.webviewID
-	panel.windowID, panel.webviewID, panel.pendingShow = 0, 0, false
+	panel.windowID, panel.webviewID = 0, 0
 	panel.mu.Unlock()
 	if windowID == 0 {
 		return
@@ -244,24 +239,15 @@ func showPanel() {
 	if cfg.RefreshOnOpenSec > 0 {
 		go app.scheduler.Refresh(time.Duration(cfg.RefreshOnOpenSec)*time.Second, time.Now().UnixMilli())
 	}
-	if created {
-		revealPanel()
-		return
+	if !created {
+		createPanel()
 	}
-	// Show it once the page reports its height, so it doesn't appear empty.
-	createPanel()
-	panel.mu.Lock()
-	panel.pendingShow = true
-	panel.mu.Unlock()
-	time.AfterFunc(1500*time.Millisecond, func() {
-		panel.mu.Lock()
-		pending := panel.pendingShow
-		panel.pendingShow = false
-		panel.mu.Unlock()
-		if pending {
-			revealPanel()
-		}
-	})
+	// Show it now, while still handling the click: macOS only lets the app take focus
+	// in response to one, and a new panel's page can take seconds to load when WebKit
+	// is cold (after a while idle). Shown later, the panel didn't get focus or hid
+	// again at once, so it took several clicks. Until the page paints, the window is
+	// see-through.
+	revealPanel()
 }
 
 func revealPanel() {
