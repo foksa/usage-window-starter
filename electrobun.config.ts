@@ -4,7 +4,7 @@ export default {
   app: {
     name: "Usage Window Starter",
     identifier: "dev.foksa.usage-window-starter",
-    version: "0.3.7",
+    version: "0.3.8",
   },
   runtime: {
     // It's a menu bar app: closing the settings window must not quit it.
