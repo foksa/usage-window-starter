@@ -275,6 +275,30 @@ func TestResetCheckRetriesWhileOldSessionReported(t *testing.T) {
 	}
 }
 
+func TestWeeklyResetCheckStartsNextSession(t *testing.T) {
+	setup(t)
+	var checks, starts int32
+	resetsAt := nowMs() + 80
+	Check[Codex] = func(Config) (Snapshot, error) {
+		atomic.AddInt32(&checks, 1)
+		if atomic.LoadInt32(&starts) > 0 {
+			return activeSnap, nil
+		}
+		if nowMs() < resetsAt {
+			return Snapshot{Weekly: &LimitWindow{Active: true, UsedPct: 100, ResetsAt: ms(resetsAt)}}, nil
+		}
+		return idleSnap, nil
+	}
+	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
+	s := NewScheduler(nil)
+	s.Run() // interval is 10 min, so only the reset timer can trigger the second check
+	time.Sleep(400 * time.Millisecond)
+	s.Stop()
+	if starts != 1 || checks < 3 { // initial, at weekly reset, confirm
+		t.Fatalf("starts=%d checks=%d", starts, checks)
+	}
+}
+
 func TestRestartReArmsResetCheck(t *testing.T) {
 	setup(t)
 	resetsAt := nowMs() + 60
