@@ -392,10 +392,24 @@ func (s *Scheduler) withProvider(p Provider, fn func(st *ProviderState)) bool {
 	return true
 }
 
+// blockingReset is the reset time that stands between now and the next start: the
+// running 5h session's, or the exhausted weekly limit's. Nil when there is none.
+func blockingReset(snap *Snapshot) *int64 {
+	switch {
+	case snap == nil:
+		return nil
+	case snap.FiveHour.Active:
+		return snap.FiveHour.ResetsAt
+	case snap.Weekly != nil && snap.Weekly.UsedPct >= 100:
+		return snap.Weekly.ResetsAt
+	}
+	return nil
+}
+
 // planResetCheck: besides the regular interval, check once right after the running
-// session's reset time, so the next session starts within seconds instead of up to
-// an interval later. Only while the scheduler is running, so one-off CLI commands
-// exit normally.
+// session's (or the exhausted weekly limit's) reset time, so the next session starts
+// within seconds instead of up to an interval later. Only while the scheduler is
+// running, so one-off CLI commands exit normally.
 func (s *Scheduler) planResetCheck(p Provider, snap *Snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -406,14 +420,15 @@ func (s *Scheduler) planResetCheck(p Provider, snap *Snapshot) {
 		t.Stop()
 		delete(s.resetTimers, p)
 	}
-	if snap == nil || !snap.FiveHour.Active || snap.FiveHour.ResetsAt == nil {
+	resetsAt := blockingReset(snap)
+	if resetsAt == nil {
 		delete(s.resetRetries, p)
 		return
 	}
-	delay := time.Duration(*snap.FiveHour.ResetsAt-nowMs())*time.Millisecond + Timing.ResetGrace[p]
+	delay := time.Duration(*resetsAt-nowMs())*time.Millisecond + Timing.ResetGrace[p]
 	if delay <= 0 {
-		// Past its reset time but still reported as running: ask again shortly, a few
-		// times, then leave it to the regular interval.
+		// Past its reset time but still reported as running (or exhausted): ask again
+		// shortly, a few times, then leave it to the regular interval.
 		n := s.resetRetries[p] + 1
 		if n > maxResetRetries {
 			return
