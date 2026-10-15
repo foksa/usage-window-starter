@@ -10,9 +10,6 @@ import (
 	"time"
 )
 
-// stateMu guards read-modify-write of state.json across goroutines.
-var stateMu sync.Mutex
-
 // writeFileAtomic writes via a temp file + rename, so a crash mid-write never
 // leaves a truncated file.
 func writeFileAtomic(path string, data []byte) error {
@@ -26,13 +23,8 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-func LoadState() State {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	return loadStateLocked()
-}
-
-func loadStateLocked() State {
+// loadState reads state.json; a missing or damaged file means no state yet.
+func loadState() State {
 	st := State{}
 	data, err := os.ReadFile(StateFile)
 	if err != nil {
@@ -44,14 +36,9 @@ func loadStateLocked() State {
 	return st
 }
 
-// SaveProviderState persists one provider's state without clobbering the other's.
-func SaveProviderState(p Provider, ps *ProviderState) {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	st := loadStateLocked()
-	st[p] = ps
+func saveState(st State) error {
 	data, _ := json.MarshalIndent(st, "", "  ")
-	_ = writeFileAtomic(StateFile, append(data, '\n'))
+	return writeFileAtomic(StateFile, append(data, '\n'))
 }
 
 var logMu sync.Mutex

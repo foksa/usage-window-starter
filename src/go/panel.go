@@ -57,7 +57,7 @@ type panelProvider struct {
 	Model    string            `json:"model"`
 	Enabled  bool              `json:"enabled"`
 	Busy     bool              `json:"busy"`
-	Activity string            `json:"activity"` // "checking", "starting" or ""
+	Activity core.Activity     `json:"activity"`
 	FiveHour *core.LimitWindow `json:"fiveHour"`
 	Weekly   *core.LimitWindow `json:"weekly"`
 	Error    string            `json:"error,omitempty"`
@@ -70,14 +70,14 @@ type panelStatePayload struct {
 	AppVersion string          `json:"appVersion"`
 	ActiveFrom *string         `json:"activeFrom"`
 	Update     struct {
-		Phase   string `json:"phase"`
-		Version string `json:"version"`
+		Phase   updatePhase `json:"phase"`
+		Version string      `json:"version"`
 	} `json:"update"`
 }
 
 func panelState() panelStatePayload {
-	cfg := core.LoadConfig()
-	state := core.LoadState()
+	cfg := app.store.Config()
+	state := app.store.State()
 	var s panelStatePayload
 	for _, p := range core.Providers {
 		pp := panelProvider{ID: p, Label: core.Label[p], Model: cfg.Model(p), Enabled: cfg.Enabled(p), Busy: app.scheduler.IsBusy(p), Activity: app.scheduler.Activity(p)}
@@ -235,7 +235,7 @@ func showPanel() {
 	}
 	created := panel.windowID != 0
 	panel.mu.Unlock()
-	cfg := core.LoadConfig()
+	cfg := app.store.Config()
 	if cfg.RefreshOnOpenSec > 0 {
 		go app.scheduler.Refresh(time.Duration(cfg.RefreshOnOpenSec)*time.Second, time.Now().UnixMilli())
 	}
@@ -306,9 +306,7 @@ func onPanelAction(raw json.RawMessage) {
 			app.scheduler.StartNow(a.Provider)
 		}
 	case "toggleAuto":
-		cfg := core.LoadConfig()
-		cfg.AutoStart = !cfg.AutoStart
-		_ = core.SaveConfig(cfg)
+		cfg, _ := app.store.UpdateConfig(func(c *core.Config) { c.AutoStart = !c.AutoStart })
 		refreshTray()
 		if cfg.AutoStart {
 			app.scheduler.RunDue(true, time.Now().UnixMilli())

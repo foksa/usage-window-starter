@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,8 +17,8 @@ var (
 )
 
 // setup gives each test a throwaway home (never the real one) with Claude disabled,
-// short timings, and fakes restored afterwards.
-func setup(t *testing.T) {
+// short timings, and fakes restored afterwards. It returns a store on that home.
+func setup(t *testing.T) *Store {
 	t.Helper()
 	SetHome(t.TempDir())
 	if strings.Contains(HomeDir, "/.usage-window-starter") {
@@ -25,7 +26,7 @@ func setup(t *testing.T) {
 	}
 	cfg := DefaultConfig()
 	cfg.Claude.Enabled = false
-	if err := SaveConfig(cfg); err != nil {
+	if err := saveConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
 	Notifier = func(string, string) {}
@@ -36,6 +37,7 @@ func setup(t *testing.T) {
 	Timing.ResetGrace = map[Provider]time.Duration{Claude: 20 * time.Millisecond, Codex: 20 * time.Millisecond}
 	Timing.ResetRetry = 20 * time.Millisecond
 	t.Cleanup(func() { Timing, Check, Start = savedTiming, savedCheck, savedStart })
+	return OpenStore()
 }
 
 func TestDamagedConfigIsMovedAside(t *testing.T) {
@@ -43,11 +45,11 @@ func TestDamagedConfigIsMovedAside(t *testing.T) {
 	if err := os.WriteFile(ConfigFile, []byte("{ not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := LoadConfig()
+	cfg := loadConfig()
 	if cfg.AutoStart {
 		t.Fatal("recovered config should be paused")
 	}
-	if LoadConfig().AutoStart {
+	if loadConfig().AutoStart {
 		t.Fatal("the recovered file should stay paused")
 	}
 	entries, _ := os.ReadDir(HomeDir)
@@ -80,7 +82,7 @@ func TestInvalidFieldsFallBackOneByOne(t *testing.T) {
 
 func TestSavesLeaveNoTempFiles(t *testing.T) {
 	setup(t)
-	_ = SaveConfig(DefaultConfig())
+	_ = saveConfig(DefaultConfig())
 	entries, _ := os.ReadDir(HomeDir)
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tmp") {
@@ -90,12 +92,12 @@ func TestSavesLeaveNoTempFiles(t *testing.T) {
 }
 
 func TestStartIsOnDiskBeforeConfirmDelayEnds(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var checks int32
 	var seenOnDisk int64
 	Check[Codex] = func(Config) (Snapshot, error) {
 		if atomic.AddInt32(&checks, 1) == 2 { // runs after the delay
-			if st := LoadState()[Codex]; st != nil {
+			if st := loadState()[Codex]; st != nil {
 				seenOnDisk = st.LastStartAt
 			}
 			return activeSnap, nil
@@ -103,53 +105,53 @@ func TestStartIsOnDiskBeforeConfirmDelayEnds(t *testing.T) {
 		return idleSnap, nil
 	}
 	Start[Codex] = func(Config) (string, error) { return "ok", nil }
-	NewScheduler(nil).RunDue(true, nowMs())
+	NewScheduler(store, nil).RunDue(true, nowMs())
 	if seenOnDisk == 0 {
 		t.Fatal("start wasn't persisted before the confirmation check")
 	}
 }
 
 func TestTestMessageCountsAsStart(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var starts int32
 	Check[Codex] = func(Config) (Snapshot, error) { return idleSnap, nil } // Codex can't tell a fresh session from idle yet
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
-	if _, err := s.TestModel(Codex, LoadConfig()); err != nil {
+	s := NewScheduler(store, nil)
+	if _, err := s.TestModel(Codex, store.Config()); err != nil {
 		t.Fatal(err)
 	}
 	s.RunDue(true, nowMs())
-	if starts != 1 || LoadState()[Codex].LastDecision != "started recently" {
-		t.Fatalf("starts=%d decision=%q", starts, LoadState()[Codex].LastDecision)
+	if starts != 1 || store.Provider(Codex).LastDecision != ReasonStartedRecently {
+		t.Fatalf("starts=%d decision=%q", starts, store.Provider(Codex).LastDecision)
 	}
 }
 
 func TestTestMessageDuringActiveSessionDoesNotPostpone(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	endsSoon := Snapshot{FiveHour: LimitWindow{Active: true, UsedPct: 40, ResetsAt: ms(nowMs() + 60_000)}}
 	Check[Codex] = func(Config) (Snapshot, error) { return endsSoon, nil }
 	Start[Codex] = func(Config) (string, error) { return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	s.RunDue(true, nowMs()) // records the active snapshot
-	_, _ = s.TestModel(Codex, LoadConfig())
-	if LoadState()[Codex].LastStartAt != 0 {
+	_, _ = s.TestModel(Codex, store.Config())
+	if store.Provider(Codex).LastStartAt != 0 {
 		t.Fatal("a test during an active session was counted as a start")
 	}
 }
 
 func TestTestMessageDuringCheckIsRefused(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	release := make(chan struct{})
 	Check[Codex] = func(Config) (Snapshot, error) { <-release; return activeSnap, nil }
 	var starts int32
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	done := make(chan struct{})
 	go func() { s.RunDue(true, nowMs()); close(done) }()
 	for !s.IsBusy(Codex) {
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := s.TestModel(Codex, LoadConfig()); err == nil || !strings.Contains(err.Error(), "busy") {
+	if _, err := s.TestModel(Codex, store.Config()); err == nil || !strings.Contains(err.Error(), "busy") {
 		t.Fatal("expected a busy error, got", err)
 	}
 	close(release)
@@ -160,21 +162,21 @@ func TestTestMessageDuringCheckIsRefused(t *testing.T) {
 }
 
 func TestNoChecksOutsideActiveHoursAndDueWhenTheyBegin(t *testing.T) {
-	setup(t)
-	cfg := LoadConfig()
+	store := setup(t)
+	cfg := store.Config()
 	cfg.IntervalMin = 30
 	cfg.ActiveHours = &ActiveHours{Start: "06:00", End: "23:59"}
-	_ = SaveConfig(cfg)
+	_ = store.SetConfig(cfg)
 	var checks int32
 	Check[Codex] = func(Config) (Snapshot, error) { atomic.AddInt32(&checks, 1); return activeSnap, nil }
-	s := NewScheduler(nil)
-	SaveProviderState(Codex, &ProviderState{LastCheckAt: local(2026, 9, 25, 23, 50)})
+	s := NewScheduler(store, nil)
+	store.SetProvider(Codex, ProviderState{LastCheckAt: local(2026, 9, 25, 23, 50)})
 	s.RunDue(false, local(2026, 9, 26, 3, 0)) // interval is up, but it's night
 	if checks != 0 {
 		t.Fatal("checked at night")
 	}
-	SaveProviderState(Codex, &ProviderState{LastCheckAt: local(2026, 9, 26, 5, 50)}) // e.g. a forced check
-	s.RunDue(false, local(2026, 9, 26, 6, 0))                                        // interval not up, but hours just began
+	store.SetProvider(Codex, ProviderState{LastCheckAt: local(2026, 9, 26, 5, 50)}) // e.g. a forced check
+	s.RunDue(false, local(2026, 9, 26, 6, 0))                                       // interval not up, but hours just began
 	if checks != 1 {
 		t.Fatal("not checked when active hours began")
 	}
@@ -185,27 +187,27 @@ func TestNoChecksOutsideActiveHoursAndDueWhenTheyBegin(t *testing.T) {
 }
 
 func TestRefreshChecksOnlyStaleProviders(t *testing.T) {
-	setup(t)
-	cfg := LoadConfig()
+	store := setup(t)
+	cfg := store.Config()
 	cfg.Claude.Enabled = true
-	_ = SaveConfig(cfg)
+	_ = store.SetConfig(cfg)
 	var claudeChecks, codexChecks int32
 	Check[Claude] = func(Config) (Snapshot, error) { atomic.AddInt32(&claudeChecks, 1); return activeSnap, nil }
 	Check[Codex] = func(Config) (Snapshot, error) { atomic.AddInt32(&codexChecks, 1); return activeSnap, nil }
 	now := nowMs()
-	SaveProviderState(Claude, &ProviderState{LastCheckAt: now - 30_000})
-	SaveProviderState(Codex, &ProviderState{LastCheckAt: now - 90_000})
-	NewScheduler(nil).Refresh(time.Minute, now)
+	store.SetProvider(Claude, ProviderState{LastCheckAt: now - 30_000})
+	store.SetProvider(Codex, ProviderState{LastCheckAt: now - 90_000})
+	NewScheduler(store, nil).Refresh(time.Minute, now)
 	if claudeChecks != 0 || codexChecks != 1 {
 		t.Fatalf("claude=%d codex=%d", claudeChecks, codexChecks)
 	}
 }
 
 func TestStateIsSavedWhenCheckFails(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	Check[Codex] = func(Config) (Snapshot, error) { return Snapshot{}, os.ErrInvalid }
-	NewScheduler(nil).RunDue(true, nowMs())
-	if st := LoadState()[Codex]; st == nil || st.LastError != os.ErrInvalid.Error() {
+	NewScheduler(store, nil).RunDue(true, nowMs())
+	if st := store.Provider(Codex); st.LastError != os.ErrInvalid.Error() {
 		t.Fatalf("%+v", st)
 	}
 }
@@ -227,7 +229,7 @@ func TestAppServerWithoutPingDir(t *testing.T) {
 }
 
 func TestResetCheckStartsNextSession(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var checks, starts int32
 	resetsAt := nowMs() + 80
 	Check[Codex] = func(Config) (Snapshot, error) {
@@ -241,7 +243,7 @@ func TestResetCheckStartsNextSession(t *testing.T) {
 		return idleSnap, nil
 	}
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	s.Run() // interval is 10 min, so only the reset timer can trigger the second check
 	time.Sleep(400 * time.Millisecond)
 	s.Stop()
@@ -251,7 +253,7 @@ func TestResetCheckStartsNextSession(t *testing.T) {
 }
 
 func TestResetCheckRetriesWhileOldSessionReported(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var calls, starts int32
 	resetsAt := nowMs() + 40
 	Check[Codex] = func(Config) (Snapshot, error) {
@@ -266,7 +268,7 @@ func TestResetCheckRetriesWhileOldSessionReported(t *testing.T) {
 		return idleSnap, nil
 	}
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	s.Run()
 	time.Sleep(500 * time.Millisecond)
 	s.Stop()
@@ -276,7 +278,7 @@ func TestResetCheckRetriesWhileOldSessionReported(t *testing.T) {
 }
 
 func TestWeeklyResetCheckStartsNextSession(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var checks, starts int32
 	resetsAt := nowMs() + 80
 	Check[Codex] = func(Config) (Snapshot, error) {
@@ -290,7 +292,7 @@ func TestWeeklyResetCheckStartsNextSession(t *testing.T) {
 		return idleSnap, nil
 	}
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	s.Run() // interval is 10 min, so only the reset timer can trigger the second check
 	time.Sleep(400 * time.Millisecond)
 	s.Stop()
@@ -300,10 +302,10 @@ func TestWeeklyResetCheckStartsNextSession(t *testing.T) {
 }
 
 func TestRestartReArmsResetCheck(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	resetsAt := nowMs() + 60
 	// Checked just before the restart, so the regular interval isn't due for 10 minutes.
-	SaveProviderState(Codex, &ProviderState{
+	store.SetProvider(Codex, ProviderState{
 		LastCheckAt:  nowMs(),
 		LastSnapshot: &Snapshot{FiveHour: LimitWindow{Active: true, UsedPct: 50, ResetsAt: ms(resetsAt)}},
 	})
@@ -315,7 +317,7 @@ func TestRestartReArmsResetCheck(t *testing.T) {
 		return idleSnap, nil
 	}
 	Start[Codex] = func(Config) (string, error) { atomic.AddInt32(&starts, 1); return "ok", nil }
-	s := NewScheduler(nil)
+	s := NewScheduler(store, nil)
 	s.Run()
 	time.Sleep(400 * time.Millisecond)
 	s.Stop()
@@ -325,13 +327,13 @@ func TestRestartReArmsResetCheck(t *testing.T) {
 }
 
 func TestOneOffCommandsLeaveNoTimers(t *testing.T) {
-	setup(t)
+	store := setup(t)
 	var checks int32
 	Check[Codex] = func(Config) (Snapshot, error) {
 		atomic.AddInt32(&checks, 1)
 		return Snapshot{FiveHour: LimitWindow{Active: true, UsedPct: 5, ResetsAt: ms(nowMs() + 50)}}, nil
 	}
-	NewScheduler(nil).RunDue(true, nowMs()) // not running: no reset timer
+	NewScheduler(store, nil).RunDue(true, nowMs()) // not running: no reset timer
 	time.Sleep(200 * time.Millisecond)
 	if checks != 1 {
 		t.Fatal("checks =", checks)
@@ -363,9 +365,9 @@ func TestBareCommandNamesResolveOnTheCliPath(t *testing.T) {
 }
 
 func TestActivityShowsStartingDuringStartAndConfirmation(t *testing.T) {
-	setup(t)
-	var seen []string
-	s := NewScheduler(nil)
+	store := setup(t)
+	var seen []Activity
+	s := NewScheduler(store, nil)
 	var checks int32
 	Check[Codex] = func(Config) (Snapshot, error) {
 		if atomic.AddInt32(&checks, 1) == 1 {
@@ -377,8 +379,8 @@ func TestActivityShowsStartingDuringStartAndConfirmation(t *testing.T) {
 	}
 	Start[Codex] = func(Config) (string, error) { seen = append(seen, s.Activity(Codex)); return "ok", nil }
 	s.RunDue(true, nowMs())
-	want := []string{"checking", "starting", "starting"}
-	if strings.Join(seen, ",") != strings.Join(want, ",") || s.Activity(Codex) != "" {
+	want := []Activity{Checking, Starting, Starting}
+	if !slices.Equal(seen, want) || s.Activity(Codex) != Idle {
 		t.Fatalf("activity = %v, after = %q", seen, s.Activity(Codex))
 	}
 }
@@ -416,5 +418,25 @@ func TestOldLoginAgentsAreRemoved(t *testing.T) {
 		if exists(p) {
 			t.Fatal("left behind:", p)
 		}
+	}
+}
+
+func TestStartNowReportsResult(t *testing.T) {
+	store := setup(t)
+	var checks int32
+	Check[Codex] = func(Config) (Snapshot, error) {
+		if atomic.AddInt32(&checks, 1) == 1 {
+			return idleSnap, nil
+		}
+		return activeSnap, nil
+	}
+	Start[Codex] = func(Config) (string, error) { return "ok", nil }
+	s := NewScheduler(store, nil)
+	if r := s.StartNow(Codex); r.Error != "" || r.FiveHour == nil || !r.FiveHour.Active {
+		t.Fatalf("%+v", r)
+	}
+	s.claim(Codex)
+	if r := s.StartNow(Codex); !strings.Contains(r.Error, "busy") {
+		t.Fatal("busy provider:", r)
 	}
 }

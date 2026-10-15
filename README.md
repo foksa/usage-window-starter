@@ -41,10 +41,10 @@ Hutch installs to `~/.hutch/bin`. Run `hutch electrobun sync` once after cloning
 Installed apps fetch `stable-macos-arm64-update.json` from the latest release (`release.baseUrl`), download the full app, and hand it to Electrobun's native update helper, which replaces the app and restarts it. Dev builds never update.
 
 ## CLI
-A dev tool for checking things without the app, for example what the parser sees after a CLI update. It's the same binary with a subcommand, and it shares the same config and state. `bun run status` (or `sh scripts/go.sh run ./src/go status`) shows each provider's 5h and weekly usage and whether it would start a session now; `start <claude|codex>` sends a start message now; `models` lists the models you can pick. The built app's binary works too: `"<app>/Contents/MacOS/main" status`.
+A dev tool for checking things without the app, for example what the parser sees after a CLI update. It's the same binary with a subcommand, and it shares the same config and state. `bun run status` (or `sh scripts/go.sh run ./src/go status`) shows each provider's 5h and weekly usage and whether it would start a session now; `start <claude|codex>` sends a start message now (through the running app, when there is one, so its state stays current); `models` lists the models you can pick. The built app's binary works too: `"<app>/Contents/MacOS/main" status`.
 
 ## Files
-- `~/.usage-window-starter/config.json`: settings (edited by the Settings window)
+- `~/.usage-window-starter/config.json`: settings (edited by the Settings window). The running app reads it only at launch and overwrites it on save, so edit it by hand only while the app is quit.
 - `~/.usage-window-starter/log.jsonl`: one line per check or start
 - `~/.usage-window-starter/state.json`: last snapshot and start time for each provider
 - `~/Library/LaunchAgents/dev.foksa.usage-window-starter.login.plist`: only when **Launch at login** is on

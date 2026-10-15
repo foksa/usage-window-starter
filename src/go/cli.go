@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,30 +14,35 @@ import (
 const cliUsage = "usage: usage-window-starter [status | start <claude|codex> | models]"
 
 // runCLI is a dev tool for checking things without the app, e.g. what the parser
-// sees after a CLI update. It shares the app's config and state.
+// sees after a CLI update. It reads the app's config and state. "start" changes
+// state, so when the app is running it asks the app to do it.
 func runCLI(args []string) int {
 	switch args[0] {
 	case "status":
-		status()
+		status(core.OpenStore())
 	case "start":
 		if len(args) < 2 || (args[1] != "claude" && args[1] != "codex") {
 			fmt.Fprintln(os.Stderr, "usage: usage-window-starter start <claude|codex>")
 			return 1
 		}
 		p := core.Provider(args[1])
-		core.NewScheduler(nil).StartNow(p)
-		st := core.LoadState()[p]
-		if st != nil && st.LastError != "" {
-			fmt.Fprintln(os.Stderr, "failed:", st.LastError)
+		r, err := startSession(p)
+		if errors.Is(err, core.ErrNotResponding) {
+			fmt.Fprintln(os.Stderr, "the running app didn't answer")
 			return 1
 		}
-		var w *core.LimitWindow
-		if st != nil && st.LastSnapshot != nil {
-			w = &st.LastSnapshot.FiveHour
+		if err != nil {
+			// e.g. a version from before the CLI could ask it
+			fmt.Fprintln(os.Stderr, "couldn't reach the running app (quit it to start from here):", err)
+			return 1
 		}
-		fmt.Printf("%s: %s\n", core.Label[p], core.FmtWindow(w, false, time.Now().UnixMilli()))
+		if r.Error != "" {
+			fmt.Fprintln(os.Stderr, "failed:", r.Error)
+			return 1
+		}
+		fmt.Printf("%s: %s\n", core.Label[p], core.FmtWindow(r.FiveHour, false, time.Now().UnixMilli()))
 	case "models":
-		cfg := core.LoadConfig()
+		cfg := core.OpenStore().Config()
 		var ids []string
 		for _, m := range core.ClaudeModels {
 			ids = append(ids, m.ID)
@@ -84,9 +90,22 @@ func runCLI(args []string) int {
 	return 0
 }
 
-func status() {
-	cfg := core.LoadConfig()
-	state := core.LoadState()
+// startSession has the running app start p's session, or starts it here when the
+// app isn't running.
+func startSession(p core.Provider) (core.StartResult, error) {
+	lock, _, err := core.AcquireInstanceLock()
+	if errors.Is(err, core.ErrAlreadyRunning) {
+		fmt.Fprintln(os.Stderr, "Asking the running app to start it…")
+		return core.RequestStart(p, 5*time.Minute)
+	}
+	if lock != nil {
+		lock.Close() // only checking: holding it would make the app think it's running
+	}
+	return core.NewScheduler(core.OpenStore(), nil).StartNow(p), nil
+}
+
+func status(store *core.Store) {
+	cfg := store.Config()
 	var enabled []core.Provider
 	for _, p := range core.Providers {
 		if cfg.Enabled(p) {
@@ -99,17 +118,14 @@ func status() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			st := state[p]
-			if st == nil {
-				st = &core.ProviderState{}
-			}
+			st := store.Provider(p)
 			var b strings.Builder
 			fmt.Fprintf(&b, "%s (%s)\n", core.Label[p], cfg.Model(p))
 			if snap, err := core.Check[p](cfg); err != nil {
 				fmt.Fprintf(&b, "  check failed: %s\n", err)
 			} else {
 				now := time.Now().UnixMilli()
-				d := core.ShouldStart(snap, st, now, cfg)
+				d := core.ShouldStart(snap, &st, now, cfg)
 				fmt.Fprintf(&b, "  5h:     %s\n", core.FmtWindow(&snap.FiveHour, false, now))
 				fmt.Fprintf(&b, "  weekly: %s\n", core.FmtWindow(snap.Weekly, true, now))
 				if d.Start {

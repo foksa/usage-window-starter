@@ -177,12 +177,13 @@ func roundTrip(c Config) any {
 	return raw
 }
 
-func LoadConfig() Config {
+// loadConfig reads config.json, creating it with the defaults when missing.
+func loadConfig() Config {
 	_ = os.MkdirAll(HomeDir, 0o755)
 	data, err := os.ReadFile(ConfigFile)
 	if os.IsNotExist(err) {
 		d := DefaultConfig()
-		_ = SaveConfig(d)
+		_ = saveConfig(d)
 		return d
 	}
 	var raw any
@@ -195,7 +196,7 @@ func LoadConfig() Config {
 		// they look at Settings again.
 		recovered := DefaultConfig()
 		recovered.AutoStart = false
-		_ = SaveConfig(recovered)
+		_ = saveConfig(recovered)
 		Notify("Usage Window Starter",
 			"Settings file was damaged. Auto-start is paused until you check Settings. The old file was saved as "+backup)
 		return recovered
@@ -203,7 +204,7 @@ func LoadConfig() Config {
 	return SanitizeConfig(raw, DefaultConfig())
 }
 
-func SaveConfig(c Config) error {
-	data, _ := json.MarshalIndent(SanitizeConfig(roundTrip(c), DefaultConfig()), "", "  ")
+func saveConfig(c Config) error {
+	data, _ := json.MarshalIndent(c, "", "  ")
 	return writeFileAtomic(ConfigFile, append(data, '\n'))
 }

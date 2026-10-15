@@ -29,7 +29,7 @@ type ProviderState struct {
 	LastCheckAt         int64     `json:"lastCheckAt,omitempty"`
 	LastSnapshot        *Snapshot `json:"lastSnapshot,omitempty"`
 	LastStartAt         int64     `json:"lastStartAt,omitempty"`
-	LastDecision        string    `json:"lastDecision,omitempty"`
+	LastDecision        Reason    `json:"lastDecision,omitempty"`
 	LastError           string    `json:"lastError,omitempty"`
 	ConsecutiveFailures int       `json:"consecutiveFailures,omitempty"`
 	FailureNotified     bool      `json:"failureNotified,omitempty"`

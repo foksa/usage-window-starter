@@ -182,13 +182,13 @@ func TestShouldStart(t *testing.T) {
 		cfg  Config
 		want Decision
 	}{
-		{"idle → start", idle, ProviderState{}, cfg, Decision{true, "5h session idle"}},
-		{"active → wait", activeSnap, ProviderState{}, cfg, Decision{false, "5h session active"}},
-		{"started recently → wait", idle, ProviderState{LastStartAt: NOW - 5*60_000}, cfg, Decision{false, "started recently"}},
-		{"started long ago → start", idle, ProviderState{LastStartAt: NOW - 6*3600_000}, cfg, Decision{true, "5h session idle"}},
-		{"weekly exhausted → wait", exhausted, ProviderState{}, cfg, Decision{false, "weekly limit exhausted"}},
-		{"auto-start paused → wait", idle, ProviderState{}, paused, Decision{false, "auto-start paused"}},
-		{"outside active hours → wait", idle, ProviderState{}, afternoon, Decision{false, "outside active hours"}},
+		{"idle → start", idle, ProviderState{}, cfg, Decision{true, ReasonIdle}},
+		{"active → wait", activeSnap, ProviderState{}, cfg, Decision{false, ReasonActive}},
+		{"started recently → wait", idle, ProviderState{LastStartAt: NOW - 5*60_000}, cfg, Decision{false, ReasonStartedRecently}},
+		{"started long ago → start", idle, ProviderState{LastStartAt: NOW - 6*3600_000}, cfg, Decision{true, ReasonIdle}},
+		{"weekly exhausted → wait", exhausted, ProviderState{}, cfg, Decision{false, ReasonWeeklyExhausted}},
+		{"auto-start paused → wait", idle, ProviderState{}, paused, Decision{false, ReasonPaused}},
+		{"outside active hours → wait", idle, ProviderState{}, afternoon, Decision{false, ReasonOutsideHours}},
 	}
 	for _, c := range cases {
 		if got := ShouldStart(c.snap, &c.st, NOW, c.cfg); got != c.want {

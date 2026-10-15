@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"electrobun"
@@ -28,6 +26,7 @@ var app struct {
 	bundle    electrobun.BundlePaths
 	viewsDir  string
 	trayID    uint32
+	store     *core.Store
 	scheduler *core.Scheduler
 	updates   *Updates
 	lock      *os.File
@@ -38,10 +37,14 @@ func runApp() error {
 	lock, pid, err := core.AcquireInstanceLock()
 	if errors.Is(err, core.ErrAlreadyRunning) {
 		// Show the running copy's panel instead, so opening the app again isn't a no-op.
-		if pid > 0 {
-			_ = syscall.Kill(pid, syscall.SIGUSR1)
+		if err := core.RequestShow(8 * time.Second); !errors.Is(err, core.ErrNotResponding) || pid <= 0 {
+			return nil
 		}
-		return nil
+		// It took the request but didn't answer, so it's hung: replace it.
+		fmt.Fprintln(os.Stderr, "[usage-window-starter] running copy", pid, "is not responding; replacing it")
+		if lock, err = core.StopInstance(pid); err != nil {
+			return fmt.Errorf("replace hung copy %d: %w", pid, err)
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "[usage-window-starter] instance lock:", err)
@@ -72,7 +75,8 @@ func runApp() error {
 	}
 	migrateLoginItem()
 
-	app.scheduler = core.NewScheduler(refreshTray)
+	app.store = core.OpenStore()
+	app.scheduler = core.NewScheduler(app.store, refreshTray)
 	app.updates = newUpdates(bundle, refreshTray)
 
 	go startUI()
@@ -114,14 +118,11 @@ func startUI() {
 	if os.Getenv("USAGE_WINDOW_STARTER_OPEN_PANEL") != "" {
 		time.AfterFunc(1500*time.Millisecond, showPanel)
 	}
-	// A second copy that was started signals this one to show its panel.
-	shows := make(chan os.Signal, 1)
-	signal.Notify(shows, syscall.SIGUSR1)
-	go func() {
-		for range shows {
-			showPanel()
-		}
-	}()
+	// A second copy that was started asks this one to show its panel, and the CLI
+	// asks it to start sessions.
+	if _, err := core.ServeRequests(core.Handlers{Show: showPanel, Start: app.scheduler.StartNow}); err != nil {
+		fmt.Fprintln(os.Stderr, "[usage-window-starter] requests:", err)
+	}
 	// Keep the countdown in the menu bar fresh between checks.
 	go func() {
 		for range time.Tick(30 * time.Second) {
@@ -143,8 +144,8 @@ var short = map[core.Provider]string{core.Claude: "C", core.Codex: "X"}
 // "C – · X –" instead of stale data. With times turned off it's just the icon, plus
 // "!" after an error and "⏸" when paused.
 func trayTitle() string {
-	cfg := core.LoadConfig()
-	state := core.LoadState()
+	cfg := app.store.Config()
+	state := app.store.State()
 	now := time.Now().UnixMilli()
 	if !cfg.TrayShowTimes {
 		var parts []string

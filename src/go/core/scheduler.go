@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -74,25 +75,49 @@ func ActiveHoursBegan(ah *ActiveHours, now int64) (int64, bool) {
 	return d.UnixMilli(), true
 }
 
+// Reason says why a check did or didn't start a session. The value is what
+// state.json and the log record.
+type Reason string
+
+const (
+	ReasonIdle             Reason = "5h session idle"
+	ReasonActive           Reason = "5h session active"
+	ReasonPaused           Reason = "auto-start paused"
+	ReasonWeeklyExhausted  Reason = "weekly limit exhausted"
+	ReasonOutsideHours     Reason = "outside active hours"
+	ReasonStartedRecently  Reason = "started recently"
+	ReasonStartUnconfirmed Reason = "start sent, session not reported yet"
+)
+
 type Decision struct {
 	Start  bool
-	Reason string
+	Reason Reason
 }
+
+// Activity is what a provider is busy with; "" is idle. The value is what the
+// panel gets.
+type Activity string
+
+const (
+	Idle     Activity = ""
+	Checking Activity = "checking"
+	Starting Activity = "starting"
+)
 
 func ShouldStart(snap Snapshot, st *ProviderState, now int64, cfg Config) Decision {
 	switch {
 	case snap.FiveHour.Active:
-		return Decision{false, "5h session active"}
+		return Decision{false, ReasonActive}
 	case !cfg.AutoStart:
-		return Decision{false, "auto-start paused"}
+		return Decision{false, ReasonPaused}
 	case snap.Weekly != nil && snap.Weekly.UsedPct >= 100:
-		return Decision{false, "weekly limit exhausted"}
+		return Decision{false, ReasonWeeklyExhausted}
 	case !InActiveHours(cfg.ActiveHours, now):
-		return Decision{false, "outside active hours"}
+		return Decision{false, ReasonOutsideHours}
 	case st.LastStartAt != 0 && now-st.LastStartAt < startCooldownMs:
-		return Decision{false, "started recently"}
+		return Decision{false, ReasonStartedRecently}
 	}
-	return Decision{true, "5h session idle"}
+	return Decision{true, ReasonIdle}
 }
 
 // SessionActive reports whether a snapshot shows a 5h session that's still running
@@ -110,7 +135,8 @@ func nowMs() int64 { return time.Now().UnixMilli() }
 // Mutates st. persist is called as soon as a start succeeds, so the cooldown survives
 // a quit or crash during the confirmation delay. starting, if set, is called when it
 // sends the start message; the start and its confirmation take a couple of minutes.
-func TickProvider(p Provider, cfg Config, st *ProviderState, now int64, persist func(*ProviderState), starting func()) {
+// Cancelling ctx (the app stopping) skips the confirmation.
+func TickProvider(ctx context.Context, p Provider, cfg Config, st *ProviderState, now int64, persist func(*ProviderState), starting func()) {
 	st.LastCheckAt = now
 	phase := "check"
 	err := func() error {
@@ -139,16 +165,21 @@ func TickProvider(p Provider, cfg Config, st *ProviderState, now int64, persist 
 			persist(st)
 		}
 		phase = "check"
-		time.Sleep(Timing.ConfirmDelay)
+		st.LastDecision = ReasonStartUnconfirmed
+		select {
+		case <-time.After(Timing.ConfirmDelay):
+		case <-ctx.Done():
+			Log("provider", p, "event", "start", "model", cfg.Model(p), "reply", reply, "confirmed", false)
+			return nil
+		}
 		after, err := Check[p](cfg)
 		if err != nil {
 			return err
 		}
 		st.LastSnapshot = &after
-		st.LastDecision = "start sent, session not reported yet"
 		msg := fmt.Sprintf("%s start message sent, but no active session reported yet", Label[p])
 		if after.FiveHour.Active {
-			st.LastDecision = "5h session active"
+			st.LastDecision = ReasonActive
 			msg = fmt.Sprintf("%s 5h session started — resets %s", Label[p], FmtTime(after.FiveHour.ResetsAt))
 		}
 		Log("provider", p, "event", "start", "model", cfg.Model(p), "reply", reply, "fiveHour", after.FiveHour)
@@ -176,88 +207,166 @@ func TickProvider(p Provider, cfg Config, st *ProviderState, now int64, persist 
 	}
 }
 
-// Scheduler runs checks on the configured interval. It wakes every minute and
-// compares wall-clock time, so checks catch up right after the Mac wakes from sleep.
+// maxNap bounds how long the scheduler sleeps between looks at the clock. Go timers
+// run on a clock that stops while the Mac sleeps, so a deadline that passed during
+// sleep is only noticed when the timer fires; this keeps that within a minute of
+// waking.
+const maxNap = time.Minute
+
+// Scheduler decides when each provider is checked: on the configured interval, as
+// soon as active hours begin, and right after a reported reset time. While running,
+// one goroutine owns the timing. It sleeps until the earliest of those deadlines (or
+// maxNap), runs what's due, and works out the next one. Checks themselves run in their
+// own goroutines, one at a time per provider.
 type Scheduler struct {
 	OnChange func()
+	store    *Store
+	// replan wakes the loop to work out its next deadline again.
+	replan chan struct{}
 
 	mu sync.Mutex
-	// activity is "checking" or "starting" while a provider is busy.
-	activity     map[Provider]string
-	stop         chan struct{}
-	resetTimers  map[Provider]*time.Timer
+	// activity is set while a provider is busy.
+	activity map[Provider]Activity
+	// ctx and cancel are set while running; cancel stops the loop and any
+	// confirmation wait.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// resetAt is when to check each provider again because of a reset time.
+	resetAt      map[Provider]int64
 	resetRetries map[Provider]int
 }
 
-func NewScheduler(onChange func()) *Scheduler {
+func NewScheduler(store *Store, onChange func()) *Scheduler {
 	if onChange == nil {
 		onChange = func() {}
 	}
 	return &Scheduler{
 		OnChange:     onChange,
-		activity:     map[Provider]string{},
-		resetTimers:  map[Provider]*time.Timer{},
+		store:        store,
+		replan:       make(chan struct{}, 1),
+		activity:     map[Provider]Activity{},
+		resetAt:      map[Provider]int64{},
 		resetRetries: map[Provider]int{},
 	}
 }
 
 func (s *Scheduler) Run() {
 	s.mu.Lock()
-	if s.stop != nil {
+	if s.cancel != nil {
 		s.mu.Unlock()
 		return
 	}
-	stop := make(chan struct{})
-	s.stop = stop
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx, s.cancel = ctx, cancel
 	s.mu.Unlock()
-
-	go func() {
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				s.RunDue(false, nowMs())
-			}
-		}
-	}()
-	// The first RunDue may skip providers checked recently (e.g. right after a
-	// restart), so re-arm reset checks from the saved snapshots.
-	cfg := LoadConfig()
-	state := LoadState()
+	// The first round may skip providers checked recently (e.g. right after a
+	// restart), so plan reset checks from the saved snapshots.
+	cfg := s.store.Config()
 	for _, p := range Providers {
-		if cfg.Enabled(p) && state[p] != nil {
-			s.planResetCheck(p, state[p].LastSnapshot)
+		if cfg.Enabled(p) {
+			s.planResetCheck(p, s.store.Provider(p).LastSnapshot)
 		}
 	}
-	go s.RunDue(false, nowMs())
+	go s.loop(ctx)
 }
 
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stop != nil {
-		close(s.stop)
-		s.stop = nil
+	if s.cancel != nil {
+		s.cancel()
+		s.ctx, s.cancel = nil, nil
 	}
-	for p, t := range s.resetTimers {
-		t.Stop()
-		delete(s.resetTimers, p)
+	clear(s.resetAt)
+	clear(s.resetRetries)
+}
+
+// runCtx is the context work runs under: the running scheduler's, or one that's never
+// cancelled for one-off use (the CLI).
+func (s *Scheduler) runCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+func (s *Scheduler) poke() {
+	select {
+	case s.replan <- struct{}{}:
+	default: // a replan is already pending
 	}
 }
 
-func (s *Scheduler) IsBusy(p Provider) bool { return s.Activity(p) != "" }
+func (s *Scheduler) loop(ctx context.Context) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		case <-s.replan:
+		}
+		now := nowMs()
+		cfg := s.store.Config()
+		s.runDueResets(cfg, now)
+		if InActiveHours(cfg.ActiveHours, now) {
+			s.dispatch(cfg, now, s.isDue(cfg, now, false))
+		}
+		timer.Reset(s.nap(cfg, now))
+	}
+}
 
-// Activity is what provider p is doing: "checking", "starting", or "" when idle.
-func (s *Scheduler) Activity(p Provider) string {
+// nap is how long the loop can sleep: until the next reset check, the next regular
+// check of a provider that isn't busy (a busy one replans when it's done), or the
+// start of active hours.
+func (s *Scheduler) nap(cfg Config, now int64) time.Duration {
+	next := now + maxNap.Milliseconds()
+	consider := func(t int64) { next = min(next, t) }
+	s.mu.Lock()
+	for _, t := range s.resetAt {
+		consider(t)
+	}
+	s.mu.Unlock()
+	if InActiveHours(cfg.ActiveHours, now) {
+		for _, p := range Providers {
+			if cfg.Enabled(p) && !s.IsBusy(p) {
+				consider(s.store.Provider(p).LastCheckAt + int64(cfg.IntervalMin)*60_000)
+			}
+		}
+	} else if start, ok := nextActiveStart(cfg.ActiveHours, now); ok {
+		consider(start)
+	}
+	return max(time.Duration(next-now)*time.Millisecond, 0)
+}
+
+// nextActiveStart is when active hours next begin after now (false when there are
+// none, i.e. always active).
+func nextActiveStart(ah *ActiveHours, now int64) (int64, bool) {
+	if ah == nil {
+		return 0, false
+	}
+	s := minutesOfDay(ah.Start)
+	t := time.UnixMilli(now)
+	d := time.Date(t.Year(), t.Month(), t.Day(), s/60, s%60, 0, 0, time.Local)
+	if d.UnixMilli() <= now {
+		d = d.AddDate(0, 0, 1)
+	}
+	return d.UnixMilli(), true
+}
+
+func (s *Scheduler) IsBusy(p Provider) bool { return s.Activity(p) != Idle }
+
+// Activity is what provider p is busy with, or Idle.
+func (s *Scheduler) Activity(p Provider) Activity {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.activity[p]
 }
 
-func (s *Scheduler) setActivity(p Provider, a string) {
+func (s *Scheduler) setActivity(p Provider, a Activity) {
 	s.mu.Lock()
 	s.activity[p] = a
 	s.mu.Unlock()
@@ -266,73 +375,76 @@ func (s *Scheduler) setActivity(p Provider, a string) {
 
 // tick runs TickProvider with state persistence and activity reporting.
 func (s *Scheduler) tick(p Provider, cfg Config, st *ProviderState, now int64) {
-	TickProvider(p, cfg, st, now, func(st *ProviderState) { SaveProviderState(p, st) },
-		func() { s.setActivity(p, "starting") })
+	TickProvider(s.runCtx(), p, cfg, st, now, func(st *ProviderState) { _ = s.store.SetProvider(p, *st) },
+		func() { s.setActivity(p, Starting) })
 }
 
-func (s *Scheduler) running() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stop != nil
+// isDue reports, from a provider's last check, whether it's due: its interval has
+// elapsed, active hours began since, or force.
+func (s *Scheduler) isDue(cfg Config, now int64, force bool) func(lastCheckAt int64) bool {
+	began, inHours := ActiveHoursBegan(cfg.ActiveHours, now)
+	return func(last int64) bool {
+		return force || now-last >= int64(cfg.IntervalMin)*60_000 || (inHours && last < began)
+	}
 }
 
-// RunDue checks every enabled provider whose interval has elapsed (or all of them
-// with force). Nothing runs outside active hours unless forced. When they begin,
+// RunDue checks every enabled provider that's due (or all of them with force) and
+// waits for them. Nothing runs outside active hours unless forced. When they begin,
 // every provider not checked since is due at once, instead of each waiting out its
 // own interval.
 func (s *Scheduler) RunDue(force bool, now int64) {
-	cfg := LoadConfig()
+	cfg := s.store.Config()
 	if !force && !InActiveHours(cfg.ActiveHours, now) {
 		return
 	}
-	began, inHours := ActiveHoursBegan(cfg.ActiveHours, now)
-	s.runWhere(cfg, now, func(last int64) bool {
-		return force || now-last >= int64(cfg.IntervalMin)*60_000 || (inHours && last < began)
-	})
+	s.dispatch(cfg, now, s.isDue(cfg, now, force)).Wait()
 }
 
 // Refresh checks every enabled provider not checked within maxAge, in active hours only.
 func (s *Scheduler) Refresh(maxAge time.Duration, now int64) {
-	cfg := LoadConfig()
+	cfg := s.store.Config()
 	if !InActiveHours(cfg.ActiveHours, now) {
 		return
 	}
-	s.runWhere(cfg, now, func(last int64) bool { return now-last >= maxAge.Milliseconds() })
+	s.dispatch(cfg, now, func(last int64) bool { return now-last >= maxAge.Milliseconds() }).Wait()
 }
 
-func (s *Scheduler) runWhere(cfg Config, now int64, isDue func(lastCheckAt int64) bool) {
-	state := LoadState()
+// dispatch claims every enabled, due provider that isn't busy and checks each in its
+// own goroutine. The returned WaitGroup is done when they've all finished.
+func (s *Scheduler) dispatch(cfg Config, now int64, isDue func(lastCheckAt int64) bool) *sync.WaitGroup {
 	var wg sync.WaitGroup
 	for _, p := range Providers {
-		var last int64
-		if state[p] != nil {
-			last = state[p].LastCheckAt
-		}
-		if !cfg.Enabled(p) || s.IsBusy(p) || !isDue(last) {
+		if !cfg.Enabled(p) || !isDue(s.store.Provider(p).LastCheckAt) || !s.claim(p) {
 			continue
 		}
-		wg.Add(1)
-		go func(p Provider) {
-			defer wg.Done()
-			s.withProvider(p, func(st *ProviderState) {
-				s.tick(p, cfg, st, now)
-			})
-		}(p)
+		wg.Go(func() {
+			s.runClaimed(p, func(st *ProviderState) { s.tick(p, cfg, st, now) })
+		})
 	}
-	wg.Wait()
+	return &wg
 }
 
 // StartNow starts a session right now if it's idle, ignoring pause, cooldown and
-// active hours.
-func (s *Scheduler) StartNow(p Provider) {
-	cfg := LoadConfig()
+// active hours, and reports how it went.
+func (s *Scheduler) StartNow(p Provider) StartResult {
+	cfg := s.store.Config()
 	cfg.AutoStart = true
 	cfg.ActiveHours = nil
-	s.withProvider(p, func(st *ProviderState) {
+	ok := s.withProvider(p, func(st *ProviderState) {
 		st.LastStartAt = 0
 		st.FailureNotified = false
 		s.tick(p, cfg, st, nowMs())
 	})
+	if !ok {
+		return StartResult{Error: fmt.Sprintf("%s is busy with %s, try again in a moment", Label[p], s.Activity(p))}
+	}
+	st := s.store.Provider(p)
+	r := StartResult{Error: st.LastError}
+	if st.LastSnapshot != nil {
+		w := st.LastSnapshot.FiveHour
+		r.FiveHour = &w
+	}
+	return r
 }
 
 // TestModel sends one test message with an unsaved config. It shares the provider
@@ -356,7 +468,7 @@ func (s *Scheduler) TestModel(p Provider, cfg Config) (string, error) {
 	})
 	if !ok {
 		doing := "a check"
-		if s.Activity(p) == "starting" {
+		if s.Activity(p) == Starting {
 			doing = "starting a session"
 		}
 		return "", fmt.Errorf("%s is busy with %s, try again in a moment", Label[p], doing)
@@ -364,32 +476,43 @@ func (s *Scheduler) TestModel(p Provider, cfg Config) (string, error) {
 	return reply, err
 }
 
-// withProvider serializes work per provider and persists its state without
-// clobbering the other provider. Returns false when p is already busy.
+// withProvider runs fn on p's state, one piece of work per provider at a time.
+// Returns false when p is already busy.
 func (s *Scheduler) withProvider(p Provider, fn func(st *ProviderState)) bool {
+	if !s.claim(p) {
+		return false
+	}
+	s.runClaimed(p, fn)
+	return true
+}
+
+// claim marks p busy, or returns false when it already is.
+func (s *Scheduler) claim(p Provider) bool {
 	s.mu.Lock()
-	if s.activity[p] != "" {
+	if s.activity[p] != Idle {
 		s.mu.Unlock()
 		return false
 	}
-	s.activity[p] = "checking"
+	s.activity[p] = Checking
 	s.mu.Unlock()
 	s.OnChange()
+	return true
+}
 
-	st := LoadState()[p]
-	if st == nil {
-		st = &ProviderState{}
-	}
+// runClaimed runs fn on p's state, which claim has marked busy, then saves the
+// state, plans the reset check, frees p and has the loop replan.
+func (s *Scheduler) runClaimed(p Provider, fn func(st *ProviderState)) {
+	st := s.store.Provider(p)
 	defer func() {
-		SaveProviderState(p, st)
+		_ = s.store.SetProvider(p, st)
 		s.planResetCheck(p, st.LastSnapshot)
 		s.mu.Lock()
 		delete(s.activity, p)
 		s.mu.Unlock()
 		s.OnChange()
+		s.poke()
 	}()
-	fn(st)
-	return true
+	fn(&st)
 }
 
 // blockingReset is the reset time that stands between now and the next start: the
@@ -413,20 +536,18 @@ func blockingReset(snap *Snapshot) *int64 {
 func (s *Scheduler) planResetCheck(p Provider, snap *Snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stop == nil {
+	if s.cancel == nil {
 		return
 	}
-	if t := s.resetTimers[p]; t != nil {
-		t.Stop()
-		delete(s.resetTimers, p)
-	}
+	delete(s.resetAt, p)
 	resetsAt := blockingReset(snap)
 	if resetsAt == nil {
 		delete(s.resetRetries, p)
 		return
 	}
-	delay := time.Duration(*resetsAt-nowMs())*time.Millisecond + Timing.ResetGrace[p]
-	if delay <= 0 {
+	now := nowMs()
+	at := *resetsAt + Timing.ResetGrace[p].Milliseconds()
+	if at <= now {
 		// Past its reset time but still reported as running (or exhausted): ask again
 		// shortly, a few times, then leave it to the regular interval.
 		n := s.resetRetries[p] + 1
@@ -434,26 +555,34 @@ func (s *Scheduler) planResetCheck(p Provider, snap *Snapshot) {
 			return
 		}
 		s.resetRetries[p] = n
-		delay = Timing.ResetRetry
+		at = now + Timing.ResetRetry.Milliseconds()
 	} else {
 		delete(s.resetRetries, p)
 	}
-	s.resetTimers[p] = time.AfterFunc(delay, func() { s.checkAtReset(p) })
+	s.resetAt[p] = at
+	s.poke()
 }
 
-func (s *Scheduler) checkAtReset(p Provider) {
+// runDueResets starts the reset checks whose time has come. One for a provider
+// that's busy is dropped: that check's own completion plans the next one.
+func (s *Scheduler) runDueResets(cfg Config, now int64) {
 	s.mu.Lock()
-	delete(s.resetTimers, p)
-	retry := s.resetRetries[p]
-	s.mu.Unlock()
-	cfg := LoadConfig()
-	// Outside active hours the first regular check once they begin takes over.
-	if !cfg.Enabled(p) || !InActiveHours(cfg.ActiveHours, nowMs()) {
-		return
+	due := map[Provider]int{}
+	for p, at := range s.resetAt {
+		if at <= now {
+			due[p] = s.resetRetries[p]
+			delete(s.resetAt, p)
+		}
 	}
-	Log("provider", p, "event", "reset-check", "retry", retry)
-	// If a check is already running, its own completion plans the next reset check.
-	s.withProvider(p, func(st *ProviderState) {
-		s.tick(p, cfg, st, nowMs())
-	})
+	s.mu.Unlock()
+	for p, retry := range due {
+		// Outside active hours the first regular check once they begin takes over.
+		if !cfg.Enabled(p) || !InActiveHours(cfg.ActiveHours, now) || !s.claim(p) {
+			continue
+		}
+		go s.runClaimed(p, func(st *ProviderState) {
+			Log("provider", p, "event", "reset-check", "retry", retry)
+			s.tick(p, cfg, st, nowMs())
+		})
+	}
 }
