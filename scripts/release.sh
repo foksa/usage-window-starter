@@ -22,8 +22,6 @@ if gh release view "$tag" >/dev/null 2>&1; then
 fi
 
 sh scripts/go.sh test ./...
-# The build diffs against the release currently at release.baseUrl to make a patch,
-# so it has to run before the new release is published.
 rm -rf artifacts
 hutch run build
 
