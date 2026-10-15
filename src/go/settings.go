@@ -128,6 +128,7 @@ func settingsHandlers() *rpcHandlers {
 				}
 				// Model or path changes should clear stale errors and be tried on the next check.
 				refreshTray()
+				syncPanelLoaded()
 				go app.scheduler.RunDue(true, time.Now().UnixMilli())
 				return okResult{OK: true}, nil
 			},

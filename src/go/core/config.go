@@ -39,9 +39,12 @@ type Config struct {
 	// than this; 0 = never.
 	RefreshOnOpenSec int `json:"refreshOnOpenSec"`
 	// TrayShowTimes shows time left in the menu bar next to the icon.
-	TrayShowTimes bool         `json:"trayShowTimes"`
-	Claude        ClaudeConfig `json:"claude"`
-	Codex         CodexConfig  `json:"codex"`
+	TrayShowTimes bool `json:"trayShowTimes"`
+	// KeepPanelLoaded keeps the panel's web view (about 40 MB) while it's hidden, so
+	// it opens at once; off, it's closed on hiding and loaded again on the next click.
+	KeepPanelLoaded bool         `json:"keepPanelLoaded"`
+	Claude          ClaudeConfig `json:"claude"`
+	Codex           CodexConfig  `json:"codex"`
 }
 
 // Enabled reports whether provider p is turned on.
@@ -155,6 +158,7 @@ func SanitizeConfig(raw any, d Config) Config {
 		ActiveHours:      ah,
 		RefreshOnOpenSec: clampRound(u["refreshOnOpenSec"], 0, 3600, d.RefreshOnOpenSec),
 		TrayShowTimes:    boolean(u["trayShowTimes"], d.TrayShowTimes),
+		KeepPanelLoaded:  boolean(u["keepPanelLoaded"], d.KeepPanelLoaded),
 		Claude: ClaudeConfig{
 			Enabled: boolean(claude["enabled"], d.Claude.Enabled),
 			Bin:     str(claude["bin"], d.Claude.Bin),

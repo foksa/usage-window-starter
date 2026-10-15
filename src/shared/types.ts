@@ -20,6 +20,8 @@ export interface Config {
   refreshOnOpenSec: number;
   /** show time left in the menu bar next to the icon */
   trayShowTimes: boolean;
+  /** keep the panel's web view (~40 MB) while hidden, so it opens at once */
+  keepPanelLoaded: boolean;
   claude: { enabled: boolean; bin: string; model: string };
   codex: { enabled: boolean; bin: string; model: string; reasoningEffort: string };
 }

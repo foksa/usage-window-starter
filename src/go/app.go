@@ -107,7 +107,8 @@ func startUI() {
 		fmt.Fprintln(os.Stderr, "[usage-window-starter] tray:", err)
 		return
 	}
-	app.trayID = trayID // the panel is created on first click (see destroyPanel)
+	app.trayID = trayID
+	syncPanelLoaded() // without KeepPanelLoaded, the panel is created on first click
 
 	refreshTray()
 	app.scheduler.Run()

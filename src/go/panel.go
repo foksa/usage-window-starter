@@ -28,22 +28,12 @@ var panel struct {
 	// blurredAt is when the panel last hid on losing focus; a click on the icon
 	// itself causes that too.
 	blurredAt time.Time
-	// idle closes the panel once hidden (after panelIdle), which ends its WebKit
-	// processes (about 40 MB).
+	// idle closes the panel once hidden, which ends its WebKit processes (about
+	// 40 MB), unless the KeepPanelLoaded setting is on.
 	idle *time.Timer
 }
 
-// panelIdle is how long a hidden panel is kept. Recreating it takes about 0.2 s,
-// which isn't worth ~40 MB, so by default it goes right away.
-var panelIdle time.Duration
-
-func init() {
-	panel.height = 320
-	// To keep it around instead: USAGE_WINDOW_STARTER_PANEL_IDLE=3m.
-	if d, err := time.ParseDuration(os.Getenv("USAGE_WINDOW_STARTER_PANEL_IDLE")); err == nil && d > 0 {
-		panelIdle = d
-	}
-}
+func init() { panel.height = 320 }
 
 func panelIDs() (windowID, webviewID uint32) {
 	panel.mu.Lock()
@@ -271,9 +261,27 @@ func hidePanel() {
 	if panel.idle != nil {
 		panel.idle.Stop()
 	}
-	// Always via a timer: never close the window inside its own blur callback.
-	panel.idle = time.AfterFunc(panelIdle, destroyPanel)
+	if !app.store.Config().KeepPanelLoaded {
+		// Always via a timer: never close the window inside its own blur callback.
+		panel.idle = time.AfterFunc(0, destroyPanel)
+	}
 	panel.mu.Unlock()
+}
+
+// syncPanelLoaded applies the KeepPanelLoaded setting to a hidden panel: loads it
+// ahead of the next click when on, closes it when off.
+func syncPanelLoaded() {
+	if panelVisible() {
+		return
+	}
+	windowID, _ := panelIDs()
+	keep := app.store.Config().KeepPanelLoaded
+	switch {
+	case keep && windowID == 0:
+		createPanel()
+	case !keep && windowID != 0:
+		destroyPanel()
+	}
 }
 
 func togglePanel() {

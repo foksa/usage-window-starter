@@ -84,6 +84,7 @@ function readForm(): Config {
       : null,
     refreshOnOpenSec: Math.max(0, Math.min(3600, Math.round(Number(input("refreshOnOpenSec").value) || 0))),
     trayShowTimes: input("trayShowTimes").checked,
+    keepPanelLoaded: input("keepPanelLoaded").checked,
     claude: {
       ...config.claude,
       enabled: input("claude-enabled").checked,
@@ -146,6 +147,7 @@ async function init() {
   input("intervalMin").value = String(config.intervalMin);
   input("refreshOnOpenSec").value = String(config.refreshOnOpenSec);
   input("trayShowTimes").checked = config.trayShowTimes;
+  input("keepPanelLoaded").checked = config.keepPanelLoaded;
   input("activeHoursOn").checked = !!config.activeHours;
   input("ahStart").value = config.activeHours?.start ?? "08:00";
   input("ahEnd").value = config.activeHours?.end ?? "23:59";
